@@ -6,7 +6,7 @@
  *   File2: POC_ESCALATIONS TO CHARGEBLAST
  *
  * Task 1: Copy the "synced" columns from File2 -> File1 (matched by alert_id)
- * Task 2: If File1's status column == "NO", upsert that row into File2
+ * Task 2: If File1's "Refunded?" column == "NO", upsert that row into File2
  *         (matched by alert_id). If "YES" (or blank), skip.
  *
  * DUPLICATE alert_id HANDLING: if an alert_id appears more than once in
@@ -28,13 +28,13 @@
  */
 
 // ====================== CONFIG — CHECK THESE ======================
-const AlertSync_FILE1_ID = '1TSYnYtywInAl0LVRBdu6nR7JWV1C_QEyB1qNsPdKU2A'; // Alerts Tracker
-const AlertSync_FILE2_ID = '1Wv-NB_1M4BNLyXwNkVIntqFsG9vRl8VsXm_LrZ78KHI'; // ESCALATIONS TO CHARGEBLAST
+const AlertSync_FILE1_ID = '1TSYnYtywInAl0LVRBdu6nR7JWV1C_QEyB1qNsPdKU2A'; // POC_ALERT_TRACKER
+const AlertSync_FILE2_ID = '1Wv-NB_1M4BNLyXwNkVIntqFsG9vRl8VsXm_LrZ78KHI'; // POC_ESCALATIONS TO CHARGEBLAST
 
 // Tab names, confirmed via AlertSync_dumpHeaders() — pinned explicitly so a future
 // tab reorder in either spreadsheet can't silently break the sync.
-const AlertSync_FILE1_SHEET_NAME = 'Alerts Tracker';
-const AlertSync_FILE2_SHEET_NAME = 'ESCALATIONS TO CHARGEBLAST';
+const AlertSync_FILE1_SHEET_NAME = 'POC_ALERT_TRACKER';
+const AlertSync_FILE2_SHEET_NAME = 'POC_ESCALATIONS TO CHARGEBLAST';
 
 // Row where headers live (data starts on the next row)
 const AlertSync_HEADER_ROW = 1;
@@ -44,7 +44,7 @@ const AlertSync_HEADER_ROW = 1;
 const AlertSync_ALERT_ID_HEADER = 'alert_id';
 
 // Header text of File1's YES/NO gate column (column C = "Refunded?").
-const AlertSync_STATUS_HEADER = 'Refunded?';
+const AlertSync_REFUNDED_HEADER = 'Refunded?';
 
 // Header text of the 3 columns that get copied File2 -> File1.
 // These must use the SAME header text in both files so the script
@@ -61,7 +61,12 @@ const AlertSync_LOCK_WAIT_SECONDS = 30;
 const AlertSync_DRY_RUN = false;
 
 // Email address to notify when duplicate alert_ids are found.
-const AlertSync_EMAIL_NOTIFY_TO = 'gelique@centaurtea.com';
+const AlertSync_EMAIL_NOTIFY_TO = 'test@gmail.com';
+
+// Set to false to skip sending duplicate-notification emails entirely.
+// Duplicates are still detected, skipped from syncing, and logged —
+// this only silences the email step.
+const AlertSync_SEND_DUPLICATE_EMAILS = false;
 // ====================================================================
 
 
@@ -114,6 +119,20 @@ function AlertSync_runSync() {
           .setValues(task2Result.newRows);
       }
     }
+
+    // Consolidated summary — every alert_id actually touched this run,
+    // so you can cross-check against the sheets once it's done.
+    const summary = [];
+    summary.push('===== SYNC SUMMARY' + (AlertSync_DRY_RUN ? ' (DRY RUN — nothing written)' : '') + ' =====');
+    summary.push('Task1 updated (' + task1Result.updatedIds.length + '): ' +
+      (task1Result.updatedIds.length ? task1Result.updatedIds.join(', ') : 'none'));
+    summary.push('Task2 updated (' + task2Result.updatedIds.length + '): ' +
+      (task2Result.updatedIds.length ? task2Result.updatedIds.join(', ') : 'none'));
+    summary.push('Task2 inserted (' + task2Result.insertedIds.length + '): ' +
+      (task2Result.insertedIds.length ? task2Result.insertedIds.join(', ') : 'none'));
+    summary.push('Duplicates skipped (' + skipIds.size + '): ' +
+      (skipIds.size ? Array.from(skipIds).join(', ') : 'none'));
+    Logger.log(summary.join('\n'));
 
     // One consolidated email per run, covering duplicates found in either file.
     if (skipIds.size > 0) {
@@ -190,12 +209,6 @@ function AlertSync_buildDuplicateEmail_(entries) {
  * run: which file, the alert_id, and how many times it's duplicated.
  */
 function AlertSync_notifyDuplicates_(file1Sheet, file2Sheet, file1Dupes, file2Dupes) {
-  const to = AlertSync_EMAIL_NOTIFY_TO || Session.getEffectiveUser().getEmail();
-  if (!to) {
-    Logger.log('AlertSync_notifyDuplicates_: no email address available, skipping email. See log for duplicate list.');
-    return;
-  }
-
   const file1Name = file1Sheet.getParent().getName();
   const file2Name = file2Sheet.getParent().getName();
 
@@ -206,6 +219,18 @@ function AlertSync_notifyDuplicates_(file1Sheet, file2Sheet, file1Dupes, file2Du
     entries.push({ filename: file2Name, alertId: id, count: file2Dupes.idToRows[id].length }));
 
   if (entries.length === 0) return;
+
+  if (!AlertSync_SEND_DUPLICATE_EMAILS) {
+    Logger.log('Duplicate alert_id(s) found (email disabled): ' +
+      entries.map(e => e.filename + ': ' + e.alertId + ' (x' + e.count + ')').join('; '));
+    return;
+  }
+
+  const to = AlertSync_EMAIL_NOTIFY_TO || Session.getEffectiveUser().getEmail();
+  if (!to) {
+    Logger.log('AlertSync_notifyDuplicates_: no email address available, skipping email. See log for duplicate list.');
+    return;
+  }
 
   const { subject, body } = AlertSync_buildDuplicateEmail_(entries);
   MailApp.sendEmail(to, subject, body);
@@ -231,6 +256,7 @@ function AlertSync_syncChargeblastFieldsToTracker_(file1Data, file2Data, file1He
   }
 
   let changed = false;
+  const updatedIds = [];
   for (let r = AlertSync_HEADER_ROW; r < file1Data.length; r++) {
     const alertId = AlertSync_normalizeId_(file1Data[r][file1AlertCol - 1]);
     if (!alertId || skipIds.has(alertId)) continue;
@@ -246,22 +272,25 @@ function AlertSync_syncChargeblastFieldsToTracker_(file1Data, file2Data, file1He
         rowChanged = true;
       }
     });
-    if (rowChanged) changed = true;
+    if (rowChanged) {
+      changed = true;
+      updatedIds.push(alertId);
+    }
   }
 
-  return { changed };
+  return { changed, updatedIds };
 }
 
 /**
  * TASK 2
- * For every File1 row where AlertSync_STATUS_HEADER === "NO", upsert it into
+ * For every File1 row where "Refunded?" === "NO", upsert it into
  * File2 (matched by alert_id). "YES" (or blank) rows are skipped, and
- * any alert_id in skipIds is skipped regardless of status.
+ * any alert_id in skipIds is skipped regardless of Refunded? value.
  * Mutates file2Data in place for updates; returns newRows separately
  * for the caller to append.
  */
 function AlertSync_upsertUnrefundedRowsToChargeblast_(file1Data, file2Data, file1Headers, file2Headers, file1AlertCol, file2AlertCol, skipIds) {
-  const statusCol = AlertSync_getColIndex_(file1Headers, AlertSync_STATUS_HEADER, 'File1');
+  const refundedCol = AlertSync_getColIndex_(file1Headers, AlertSync_REFUNDED_HEADER, 'File1');
 
   const file2LastCol = file2Data[0].length;
   const colMap = []; // index = file2 col# - 1, value = file1 col# (or null)
@@ -277,37 +306,55 @@ function AlertSync_upsertUnrefundedRowsToChargeblast_(file1Data, file2Data, file
 
   let file2Changed = false;
   const newRows = [];
+  const updatedIds = [];
+  const insertedIds = [];
 
   for (let r = AlertSync_HEADER_ROW; r < file1Data.length; r++) {
     const row = file1Data[r];
     const alertId = AlertSync_normalizeId_(row[file1AlertCol - 1]);
     if (!alertId || skipIds.has(alertId)) continue;
 
-    const status = String(row[statusCol - 1] || '').trim().toUpperCase();
-    if (status !== 'NO') continue;
-
-    const rowToWrite = [];
-    for (let c = 0; c < file2LastCol; c++) {
-      const file1Col = colMap[c];
-      rowToWrite.push(file1Col ? row[file1Col - 1] : '');
-    }
+    const refundedValue = String(row[refundedCol - 1] || '').trim().toUpperCase();
+    if (refundedValue !== 'NO') continue;
 
     const existingIndex = file2RowIndexByAlertId[alertId];
     if (existingIndex !== undefined) {
-      if (AlertSync_rowsEqual_(file2Data[existingIndex], rowToWrite)) {
-        continue; // already identical — nothing to update
+      // Row already exists in File2 — upsert only the columns that
+      // actually changed, leaving every other cell in that row alone
+      // (including any File2-only column with no source in File1).
+      let rowChanged = false;
+      for (let c = 0; c < file2LastCol; c++) {
+        const file1Col = colMap[c];
+        if (!file1Col) continue; // no matching File1 column — leave untouched
+        const newVal = row[file1Col - 1];
+        if (!AlertSync_valuesEqual_(file2Data[existingIndex][c], newVal)) {
+          Logger.log('[Task2] alert_id ' + alertId + ': File2 row ' + (existingIndex + 1) +
+            ' col ' + (c + 1) + ' "' + file2Data[existingIndex][c] + '" -> "' + newVal + '"');
+          file2Data[existingIndex][c] = newVal;
+          rowChanged = true;
+        }
       }
-      Logger.log('[Task2] alert_id ' + alertId + ': would UPDATE existing row ' + (existingIndex + 1) + ' in File2 (values differ).');
-      file2Data[existingIndex] = rowToWrite;
-      file2Changed = true;
+      if (rowChanged) {
+        file2Changed = true;
+        updatedIds.push(alertId);
+      }
     } else {
+      // No existing row for this alert_id — insert a full new row,
+      // copying every mapped column regardless of whether it's
+      // populated or blank in File1.
+      const rowToWrite = [];
+      for (let c = 0; c < file2LastCol; c++) {
+        const file1Col = colMap[c];
+        rowToWrite.push(file1Col ? row[file1Col - 1] : '');
+      }
       Logger.log('[Task2] alert_id ' + alertId + ': would INSERT new row into File2.');
       newRows.push(rowToWrite);
+      insertedIds.push(alertId);
       file2RowIndexByAlertId[alertId] = file2Data.length + newRows.length - 1;
     }
   }
 
-  return { file2Changed, newRows };
+  return { file2Changed, newRows, updatedIds, insertedIds };
 }
 
 /**
@@ -510,7 +557,7 @@ function AlertSync_testConfig() {
 
     check('alert_id', AlertSync_ALERT_ID_HEADER, file1Headers, 'File1');
     check('alert_id', AlertSync_ALERT_ID_HEADER, file2Headers, 'File2');
-    check('status',   AlertSync_STATUS_HEADER,   file1Headers, 'File1');
+    check('Refunded?', AlertSync_REFUNDED_HEADER, file1Headers, 'File1');
     AlertSync_SYNC_HEADERS.forEach(h => {
       check('sync col', h, file1Headers, 'File1');
       check('sync col', h, file2Headers, 'File2');
@@ -576,7 +623,7 @@ function AlertSync_removeTriggers_() {
 }
 
 // Edits in File1 trigger a full sync (needed for Task 2 — any edit
-// could be the one that sets the status column to "NO").
+// could be the one that sets Refunded? to "NO").
 function AlertSync_onEditFile1_(e) {
   AlertSync_runSync();
 }
@@ -673,12 +720,15 @@ function AlertSync_onEditFile2_(e) {
       }
 
       if (skipped.length > 0) {
-        const to = AlertSync_EMAIL_NOTIFY_TO || Session.getEffectiveUser().getEmail();
-        if (to) {
-          const { subject, body } = AlertSync_buildDuplicateEmail_(skipped);
-          MailApp.sendEmail(to, subject, body);
+        if (AlertSync_SEND_DUPLICATE_EMAILS) {
+          const to = AlertSync_EMAIL_NOTIFY_TO || Session.getEffectiveUser().getEmail();
+          if (to) {
+            const { subject, body } = AlertSync_buildDuplicateEmail_(skipped);
+            MailApp.sendEmail(to, subject, body);
+          }
         }
-        Logger.log('AlertSync_onEditFile2_ skipped: ' + skipped.map(s => s.alertId).join(', '));
+        Logger.log('AlertSync_onEditFile2_ skipped (email ' + (AlertSync_SEND_DUPLICATE_EMAILS ? 'sent' : 'disabled') + '): ' +
+          skipped.map(s => s.alertId).join(', '));
       }
     } finally {
       lock.releaseLock();
